@@ -1,0 +1,216 @@
+# Headless service used to expose kafka ports and create a custom DNS url 
+# that follows the pattern: <pod-name>.kafka-headless.<namespace>.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  labels:
+    app: kafka
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: controller
+      port: 29093
+      targetPort: 29093
+    - name: internal
+      port: 9092
+      targetPort: 9092
+    - name: external
+      port: 9094
+      targetPort: 9094
+  clusterIP: None
+---
+# The StatefulSet is used to deploy Kafka, as it will create the PODs assigning to them ordinal names in base of
+# the number of replicas deployed. For example: kafka-0, kafka-1, kafka-2...
+# That way we can access to those pods, as we know that they will have always the same names.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: kafka
+  name: kafka
+spec:
+  serviceName: kafka-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:latest
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+            - containerPort: 9094
+          env:
+            - name: KAFKA_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_LISTENER_NAMES
+              value: "PLAINTEXT_INTERNAL,PLAINTEXT_EXTERNAL,CONTROLLER"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT_EXTERNAL://0.0.0.0:9094,PLAINTEXT_INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT_EXTERNAL://$(POD_NAME).kafka-headless.{namespace}.svc.cluster.local:9094,PLAINTEXT_INTERNAL://$(POD_NAME).kafka-headless.{namespace}.svc.cluster.local:9092,CONTROLLER://$(POD_NAME).kafka-headless.{namespace}.svc.cluster.local:29093"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT_INTERNAL"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "0@kafka-0.kafka-headless.{namespace}.svc.cluster.local:29093,1@kafka-1.kafka-headless.{namespace}.svc.cluster.local:29093,2@kafka-2.kafka-headless.{namespace}.svc.cluster.local:29093"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_NUM_PARTITIONS 
+              value: "3"
+            - name: KAFKA_KRAFT_MODE
+              value: "true"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# Service used to expose the port 8080 of AKHQ application.
+apiVersion: v1
+kind: Service
+metadata:
+  name: akhq
+spec:
+  ports:
+    - name: akhq-ui
+      port: 8080
+      targetPort: 8080
+  selector:
+    app: akhq
+  type: ClusterIP
+---
+# Deployment used to deploy AKHQ application. AKHQ is a UI used to manage Kafka easily from the browser
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: akhq
+  labels:
+    app: akhq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: akhq
+  template:
+    metadata:
+      labels:
+        app: akhq
+    spec:
+      containers:
+        - name: akhq
+          image: tchiotludo/akhq:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: "AKHQ_CONFIGURATION"
+              value: |
+                      akhq:
+                        connections:
+                          default:
+                            properties:
+                              bootstrap.servers: "kafka-headless.{namespace}.svc.cluster.local:9092"
+---
+# Service account needed to allow the job to create topics
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kafka-job-sa
+  namespace: {namespace}
+---
+# Role that has the permissions that we want to give to the service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: {namespace}
+  name: kafka-job-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+# Attach the role permissions to the service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: {namespace}
+  name: kafka-job-rolebinding
+subjects:
+  - kind: ServiceAccount
+    name: kafka-job-sa
+    namespace: {namespace}
+roleRef:
+  kind: Role
+  name: kafka-job-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Optional job that can be used to create topics in Kafka during the installation. 
+# If you prefer to create the topics later manually, then you can remove this Job from the configuration file.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-topics
+  labels:
+    app: kafka-create-topics
+spec:
+  template:
+    metadata:
+      labels:
+        app: kafka-create-topics
+    spec:
+      serviceAccountName: kafka-job-sa
+      containers:
+        - name: kafka-create-topics
+          image: bitnami/kubectl:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while ! kubectl wait --for=condition=ready pod/kafka-0 --timeout=5s; do
+                echo "Waiting for Kafka to be ready..."; sleep 5;
+              done;
+              echo "Kafka is ready.";
+
+              # Verify the kafka-topic.sh script exists
+              kubectl exec kafka-0 -- ls /opt/kafka/bin/kafka-topics.sh || {
+                echo "kafka-topics.sh script not found"; exit 1;
+              }
+
+              # Execute the topic creation inside the running kafka pod
+               kubectl exec kafka-0 -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-0:9092 \
+              --create \
+              --topic test_topic \
+              --partitions 3 \
+              --replication-factor 3;
+      restartPolicy: OnFailure
