@@ -16,10 +16,23 @@ spec:
     - name: internal
       port: 9092
       targetPort: 9092
+  clusterIP: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-external-service
+  labels:
+    app: kafka
+spec:
+  selector:
+    app: kafka
+  ports:
     - name: external
       port: 9094
       targetPort: 9094
-  clusterIP: None
+      nodePort: 30094
+  type: NodePort
 ---
 # The StatefulSet is used to deploy Kafka, as it will create the PODs assigning to them ordinal names in base of
 # the number of replicas deployed. For example: kafka-0, kafka-1, kafka-2...
@@ -64,7 +77,7 @@ spec:
             - name: KAFKA_LISTENERS
               value: "PLAINTEXT_EXTERNAL://0.0.0.0:9094,PLAINTEXT_INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093"
             - name: KAFKA_ADVERTISED_LISTENERS
-              value: "PLAINTEXT_EXTERNAL://$(POD_NAME).kafka-headless.{namespace}.svc.cluster.local:9094,PLAINTEXT_INTERNAL://$(POD_NAME).kafka-headless.{namespace}.svc.cluster.local:9092,CONTROLLER://$(POD_NAME).kafka-headless.{namespace}.svc.cluster.local:29093"
+              value: "PLAINTEXT_EXTERNAL://{cluster-ip}:30094,PLAINTEXT_INTERNAL://$(POD_NAME).kafka-headless.{namespace}.svc.cluster.local:9092,CONTROLLER://$(POD_NAME).kafka-headless.{namespace}.svc.cluster.local:29093"
             - name: KAFKA_INTER_BROKER_LISTENER_NAME
               value: "PLAINTEXT_INTERNAL"
             - name: KAFKA_CONTROLLER_LISTENER_NAMES
